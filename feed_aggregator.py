@@ -41,6 +41,9 @@ async def poll_all_feeds(
     tasks = [fetch_feed(session, url, api_key) for url in ALL_FEED_URLS]
     results = await asyncio.gather(*tasks)
     valid_feeds = {url: data for url, data in results if data is not None}
+    failed = len(ALL_FEED_URLS) - len(valid_feeds)
+    if failed:
+        logger.warning("Feed poll: %d/%d feeds failed", failed, len(ALL_FEED_URLS))
     if valid_feeds:
         await store.store_feeds_batch(valid_feeds)
     elapsed = time.time() - start
@@ -69,7 +72,7 @@ async def main():
             elapsed = time.time() - start
             sleep_time = max(0, 60.0 - elapsed)
             
-            logger.info(f"Poll cycle complete in {elapsed:.2f}s. Sleeping for {sleep_time:.2f}s")
+            logger.info("Poll cycle complete in %.2fs. Sleeping for %.2fs", elapsed, sleep_time)
             await asyncio.sleep(sleep_time)
 
 if __name__ == "__main__":
