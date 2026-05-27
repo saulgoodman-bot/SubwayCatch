@@ -34,6 +34,7 @@ from telegram.ext import (
     filters,
 )
 from thefuzz import fuzz, process
+from redis_feed_store import RedisFeedStore
 
 from station_metadata import (
     BOROUGH_STATION_ORDER,
@@ -59,7 +60,6 @@ _MAX_TRACKED_CHATS = 2_000
 # Allow arrivals up to 1 minute past to account for MTA feed latency (~30s updates).
 # These are clamped to 0m in display_minutes to avoid showing negative values.
 _FEED_LATENCY_TOLERANCE_MINUTES = -1
-_FEED_CACHE_TTL_SECONDS = 30
 _DEFAULT_RETRY_DELAY_SECONDS = 10
 _MAX_RETRY_DELAY_SECONDS = 120
 _MIN_REQUEST_INTERVAL_SECONDS = 2.0
@@ -209,15 +209,57 @@ async def _on_startup(app: Application) -> None:
     """Initialize per-application async resources."""
     timeout = aiohttp.ClientTimeout(total=15)
     app.bot_data["session"] = aiohttp.ClientSession(timeout=timeout)
-    app.bot_data["feed_cache"] = FeedBatchCache(ttl_seconds=_FEED_CACHE_TTL_SECONDS)
-    logger.info("aiohttp session created")
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    store = RedisFeedStore(redis_url)
+    await store.connect()
+    app.bot_data["redis_store"] = store
+
+    from feed_aggregator import ALL_FEED_URLS, poll_all_feeds
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    connector = aiohttp.TCPConnector(limit=len(ALL_FEED_URLS), ttl_dns_cache=300)
+    warm_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    try:
+        api_key = os.getenv("MTA_API_KEY")
+        if api_key:
+            await poll_all_feeds(warm_session, store, api_key)
+            logger.info("Initial feed poll complete — Redis is warm")
+        else:
+            logger.warning("MTA_API_KEY is missing; startup warm poll skipped")
+    finally:
+        await warm_session.close()
+
+    asyncio.create_task(_run_background_aggregator(app))
+    logger.info("startup complete: aiohttp + redis + background aggregator")
+
+
+async def _run_background_aggregator(app: Application) -> None:
+    """Poll all MTA feeds every 60s and write results to Redis."""
+    from feed_aggregator import ALL_FEED_URLS, poll_all_feeds
+
+    api_key = os.getenv("MTA_API_KEY")
+    redis_store: RedisFeedStore = app.bot_data["redis_store"]
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    connector = aiohttp.TCPConnector(limit=len(ALL_FEED_URLS), ttl_dns_cache=300)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        while True:
+            try:
+                if api_key:
+                    await poll_all_feeds(session, redis_store, api_key)
+            except Exception:
+                logger.exception("Background aggregator poll failed")
+            await asyncio.sleep(60)
 
 
 async def _on_shutdown(app: Application) -> None:
     """Close per-application async resources."""
     session: Optional[aiohttp.ClientSession] = app.bot_data.get("session")
+    redis_store: Optional[RedisFeedStore] = app.bot_data.get("redis_store")
     if session and not session.closed:
         await session.close()
+    if redis_store:
+        await redis_store.close()
     logger.info("aiohttp session closed")
 
 
@@ -308,8 +350,8 @@ async def _fetch_feed(
 
 
 async def fetch_mta_updates(
-    session: aiohttp.ClientSession,
-    feed_cache: FeedBatchCache,
+    _session: aiohttp.ClientSession,
+    redis_store: RedisFeedStore,
     station_code: str,
     train_filter: str = "",
 ) -> Dict[str, object]:
@@ -328,10 +370,6 @@ async def fetch_mta_updates(
             "ok": False,
             "error": f"Invalid train line '{train_filter}'. Valid trains: {VALID_TRAINS_TEXT}",
         }
-
-    api_key = os.getenv("MTA_API_KEY")
-    if not api_key:
-        return {"ok": False, "error": "Server misconfiguration: MTA_API_KEY is missing."}
 
     stop_id_prefixes = STATION_ALIAS_TO_STOP_PREFIXES[station_code]
     gtfs_base_ids: Set[str] = set(stop_id_prefixes)
@@ -373,7 +411,7 @@ async def fetch_mta_updates(
     north_label = "Uptown"
     south_label = "Downtown"
     fetch_batch_started = time.perf_counter()
-    raw_payloads = await feed_cache.get_or_fetch(session, feed_urls, api_key)
+    raw_payloads = await redis_store.get_feeds(feed_urls)
     fetch_batch_ms = (time.perf_counter() - fetch_batch_started) * 1000
 
     parse_started = time.perf_counter()
@@ -726,13 +764,13 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     train_filter, station_code = last_request
     logger.info("User requested /refresh train=%s station_code=%s", train_filter or "ALL", station_code)
     session: Optional[aiohttp.ClientSession] = context.application.bot_data.get("session")
-    feed_cache: Optional[FeedBatchCache] = context.application.bot_data.get("feed_cache")
-    if not session or not feed_cache:
+    redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
+    if not session or not redis_store:
         if update.effective_message:
             await update.effective_message.reply_text("Bot is still starting up. Please try again.")
         return
 
-    result = await fetch_mta_updates(session, feed_cache, station_code, train_filter)
+    result = await fetch_mta_updates(session, redis_store, station_code, train_filter)
     if not result["ok"]:
         if update.effective_message:
             await update.effective_message.reply_text(str(result["error"]))
@@ -807,12 +845,12 @@ async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 LAST_REQUEST_BY_CHAT[update.effective_chat.id] = (normalized_train_filter, normalized_station)
 
             session: Optional[aiohttp.ClientSession] = context.application.bot_data.get("session")
-            feed_cache: Optional[FeedBatchCache] = context.application.bot_data.get("feed_cache")
-            if not session or not feed_cache:
+            redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
+            if not session or not redis_store:
                 await message.reply_text("Bot is still starting up. Please try again.")
                 return
 
-            result = await fetch_mta_updates(session, feed_cache, station_code, normalized_train_filter)
+            result = await fetch_mta_updates(session, redis_store, station_code, normalized_train_filter)
             if not result["ok"]:
                 await message.reply_text(str(result["error"]))
                 return
