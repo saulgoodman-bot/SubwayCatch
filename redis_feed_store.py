@@ -28,13 +28,14 @@ _LAST_UPDATED_KEY = "gtfs:last_updated"
 _STATS_KEY = "gtfs:stats"
 
 # 2x the poll interval so a single missed cycle never evicts live data.
-FEED_TTL_SECONDS = 120
+FEED_TTL_SECONDS = 300
 # Data older than this is considered unhealthy (3 missed polls + slack).
 STALENESS_THRESHOLD_SECONDS = 210
 
 
 def _feed_key(feed_url: str) -> str:
     """Stable, compact Redis key derived from a feed URL."""
+    # 12 hex chars = 2^48 namespace; effectively collision-free for this small feed set.
     digest = hashlib.md5(feed_url.encode(), usedforsecurity=False).hexdigest()[:12]
     return f"{_FEED_KEY_PREFIX}{digest}"
 
@@ -66,7 +67,7 @@ class RedisFeedStore:
             max_connections=10,
         )
         await self._client.ping()
-        logger.info("Redis connected url=%s", self._redis_url)
+        logger.info("Redis connected")
 
     async def close(self) -> None:
         """Drain the connection pool gracefully."""
@@ -96,6 +97,7 @@ class RedisFeedStore:
             return
 
         ts = poll_ts if poll_ts is not None else time.time()
+        # Intentionally non-transactional: batch round-trips without MULTI/EXEC overhead.
         pipe = self._client.pipeline(transaction=False)
 
         for feed_url, data in feeds.items():
@@ -110,6 +112,7 @@ class RedisFeedStore:
                 "total_bytes": str(sum(len(b) for b in feeds.values())),
             },
         )
+        pipe.expire(_STATS_KEY, 3600)
 
         await pipe.execute()
         total_kb = sum(len(b) for b in feeds.values()) / 1024
@@ -134,6 +137,7 @@ class RedisFeedStore:
         if not feed_urls:
             return {}
 
+        # Intentionally non-transactional: batch round-trips without MULTI/EXEC overhead.
         pipe = self._client.pipeline(transaction=False)
         for url in feed_urls:
             pipe.get(_feed_key(url))
@@ -169,11 +173,13 @@ class RedisFeedStore:
         Used by the bot's startup check and any monitoring hooks.
         """
         try:
-            await self._client.ping()
-            last = await self.get_last_updated()
-            if last is None:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.ping()
+            pipe.get(_LAST_UPDATED_KEY)
+            _, last_val = await pipe.execute()
+            if not last_val:
                 return False
-            return (time.time() - last) < STALENESS_THRESHOLD_SECONDS
+            return (time.time() - float(last_val)) < STALENESS_THRESHOLD_SECONDS
         except Exception:
             logger.exception("Redis health check failed")
             return False

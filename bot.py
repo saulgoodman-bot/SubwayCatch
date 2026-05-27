@@ -6,7 +6,6 @@ import os
 import threading
 import time
 import asyncio
-from dataclasses import dataclass
 from collections import OrderedDict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +33,7 @@ from telegram.ext import (
     filters,
 )
 from thefuzz import fuzz, process
+from redis_feed_store import RedisFeedStore
 
 from station_metadata import (
     BOROUGH_STATION_ORDER,
@@ -59,7 +59,6 @@ _MAX_TRACKED_CHATS = 2_000
 # Allow arrivals up to 1 minute past to account for MTA feed latency (~30s updates).
 # These are clamped to 0m in display_minutes to avoid showing negative values.
 _FEED_LATENCY_TOLERANCE_MINUTES = -1
-_FEED_CACHE_TTL_SECONDS = 30
 _DEFAULT_RETRY_DELAY_SECONDS = 10
 _MAX_RETRY_DELAY_SECONDS = 120
 _MIN_REQUEST_INTERVAL_SECONDS = 2.0
@@ -138,87 +137,84 @@ class _LRUDict(OrderedDict):
 LAST_REQUEST_BY_CHAT: _LRUDict = _LRUDict(_MAX_TRACKED_CHATS)
 
 VALID_TRAINS_TEXT = "A,B,C,D,E,F,FS,G,GS,H,J,L,N,Q,R,S,SI,W,Z,1,2,3,4,5,5X,6,6X,7,7X"
-
-@dataclass
-class FeedCacheEntry:
-    fetched_at: float
-    data: Dict[str, bytes]
-
-
-class FeedBatchCache:
-    """Async cache for raw feed payloads with request coalescing."""
-
-    def __init__(self, ttl_seconds: int) -> None:
-        self._ttl_seconds = ttl_seconds
-        self._entries: Dict[Tuple[str, ...], FeedCacheEntry] = {}
-        self._in_flight: Dict[Tuple[str, ...], asyncio.Task[Dict[str, bytes]]] = {}
-        self._lock = asyncio.Lock()
-
-    async def get_or_fetch(self, session: aiohttp.ClientSession, feed_urls: List[str], api_key: str) -> Dict[str, bytes]:
-        key = tuple(sorted(feed_urls))
-        now = time.monotonic()
-        async with self._lock:
-            cached = self._entries.get(key)
-            if cached and now - cached.fetched_at <= self._ttl_seconds:
-                logger.info("Feed cache hit key=%s feeds=%s", key, len(key))
-                return dict(cached.data)
-
-            task = self._in_flight.get(key)
-            if task is None:
-                logger.info("Feed cache miss key=%s", key)
-                task = asyncio.create_task(self._fetch_batch(session, list(key), api_key))
-                self._in_flight[key] = task
-            else:
-                logger.info("Feed cache join in-flight key=%s", key)
-
-        try:
-            data = await task
-        except Exception:  # noqa: BLE001 - avoid surfacing shared task exceptions to handlers
-            data = {}
-            logger.exception("Feed fetch task failed for key=%s", key)
-        finally:
-            current_time = time.monotonic()
-            async with self._lock:
-                self._in_flight.pop(key, None)
-                if data:
-                    self._entries[key] = FeedCacheEntry(fetched_at=current_time, data=dict(data))
-                    self._entries = {
-                        existing_key: entry
-                        for existing_key, entry in self._entries.items()
-                        if current_time - entry.fetched_at <= self._ttl_seconds
-                    }
-        return dict(data)
-
-    async def _fetch_batch(self, session: aiohttp.ClientSession, feed_urls: List[str], api_key: str) -> Dict[str, bytes]:
-        raw_results = await asyncio.gather(
-            *[_fetch_feed(session, feed_url, api_key) for feed_url in feed_urls],
-            return_exceptions=True,
-        )
-        payloads: Dict[str, bytes] = {}
-        for item in raw_results:
-            if isinstance(item, BaseException):
-                logger.error("Unexpected exception during feed gather: %s", item, exc_info=item)
-                continue
-            feed_url, content, per_feed_fetch_ms = item
-            logger.info("mta_metrics feed_url=%s feed_fetch_ms=%.2f", feed_url, per_feed_fetch_ms)
-            if content is not None:
-                payloads[feed_url] = content
-        return payloads
+_LAST_REQUEST_TIME: _LRUDict = _LRUDict(_MAX_TRACKED_CHATS)
 
 async def _on_startup(app: Application) -> None:
     """Initialize per-application async resources."""
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    store = RedisFeedStore(redis_url)
+    await store.connect()
+    app.bot_data["redis_store"] = store
+
+    from feed_aggregator import ALL_FEED_URLS, poll_all_feeds
+
     timeout = aiohttp.ClientTimeout(total=15)
-    app.bot_data["session"] = aiohttp.ClientSession(timeout=timeout)
-    app.bot_data["feed_cache"] = FeedBatchCache(ttl_seconds=_FEED_CACHE_TTL_SECONDS)
-    logger.info("aiohttp session created")
+    connector = aiohttp.TCPConnector(limit=len(ALL_FEED_URLS), ttl_dns_cache=300)
+    warm_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    try:
+        api_key = os.getenv("MTA_API_KEY")
+        if api_key:
+            await poll_all_feeds(warm_session, store, api_key)
+            logger.info("Initial feed poll complete — Redis is warm")
+        else:
+            logger.warning("MTA_API_KEY is missing; startup warm poll skipped")
+    finally:
+        await warm_session.close()
+
+    app.bot_data["aggregator_task"] = asyncio.create_task(_supervised_aggregator(app))
+    logger.info("startup complete: aiohttp + redis + background aggregator")
+
+
+async def _run_background_aggregator(app: Application) -> None:
+    """Poll all MTA feeds every 60s and write results to Redis."""
+    from feed_aggregator import ALL_FEED_URLS, poll_all_feeds
+
+    api_key = os.getenv("MTA_API_KEY")
+    redis_store: RedisFeedStore = app.bot_data["redis_store"]
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    connector = aiohttp.TCPConnector(limit=len(ALL_FEED_URLS), ttl_dns_cache=300)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        poll_interval = 60.0
+        while True:
+            cycle_start = time.monotonic()
+            try:
+                if api_key:
+                    await poll_all_feeds(session, redis_store, api_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Background aggregator poll failed")
+            elapsed = time.monotonic() - cycle_start
+            await asyncio.sleep(max(0.0, poll_interval - elapsed))
+
+
+async def _supervised_aggregator(app: Application) -> None:
+    delay = 5.0
+    while True:
+        try:
+            await _run_background_aggregator(app)
+        except asyncio.CancelledError:
+            logger.info("Aggregator supervisor cancelled")
+            raise
+        except Exception:
+            logger.exception("Aggregator crashed; restarting in %.0fs", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120.0)
+        else:
+            break
 
 
 async def _on_shutdown(app: Application) -> None:
     """Close per-application async resources."""
-    session: Optional[aiohttp.ClientSession] = app.bot_data.get("session")
-    if session and not session.closed:
-        await session.close()
-    logger.info("aiohttp session closed")
+    redis_store: Optional[RedisFeedStore] = app.bot_data.get("redis_store")
+    aggregator_task: Optional[asyncio.Task[None]] = app.bot_data.get("aggregator_task")
+    if aggregator_task and not aggregator_task.done():
+        aggregator_task.cancel()
+        await asyncio.gather(aggregator_task, return_exceptions=True)
+    if redis_store:
+        await redis_store.close()
+    logger.info("Shutdown complete: Redis pool and aggregator task closed")
 
 
 def direction_from_stop_id(stop_id: str, gtfs_base_id: str = "") -> str:
@@ -279,37 +275,8 @@ def start_health_server() -> None:
     thread.start()
 
 
-async def _fetch_feed(
-    session: aiohttp.ClientSession,
-    feed_url: str,
-    api_key: str,
-) -> Tuple[str, Optional[bytes], float]:
-    """Fetch one GTFS feed and return URL, content, and fetch latency in milliseconds."""
-    fetch_started = time.perf_counter()
-    try:
-        async with session.get(feed_url, headers={"x-api-key": api_key}) as response:
-            if response.status == 429:
-                retry_after = response.headers.get("Retry-After", "unknown")
-                logger.error(
-                    "MTA rate limit hit feed=%s status=429 retry_after=%s",
-                    feed_url,
-                    retry_after,
-                )
-                return feed_url, None, (time.perf_counter() - fetch_started) * 1000
-            response.raise_for_status()
-            content = await response.read()
-            return feed_url, content, (time.perf_counter() - fetch_started) * 1000
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        logger.warning("MTA feed request failed feed=%s: %s", feed_url, exc)
-        return feed_url, None, (time.perf_counter() - fetch_started) * 1000
-    except Exception as exc:  # noqa: BLE001 - avoid bubbling to gather cancellation
-        logger.exception("Unexpected error fetching feed=%s", feed_url, exc_info=exc)
-        return feed_url, None, (time.perf_counter() - fetch_started) * 1000
-
-
 async def fetch_mta_updates(
-    session: aiohttp.ClientSession,
-    feed_cache: FeedBatchCache,
+    redis_store: RedisFeedStore,
     station_code: str,
     train_filter: str = "",
 ) -> Dict[str, object]:
@@ -328,10 +295,6 @@ async def fetch_mta_updates(
             "ok": False,
             "error": f"Invalid train line '{train_filter}'. Valid trains: {VALID_TRAINS_TEXT}",
         }
-
-    api_key = os.getenv("MTA_API_KEY")
-    if not api_key:
-        return {"ok": False, "error": "Server misconfiguration: MTA_API_KEY is missing."}
 
     stop_id_prefixes = STATION_ALIAS_TO_STOP_PREFIXES[station_code]
     gtfs_base_ids: Set[str] = set(stop_id_prefixes)
@@ -373,7 +336,11 @@ async def fetch_mta_updates(
     north_label = "Uptown"
     south_label = "Downtown"
     fetch_batch_started = time.perf_counter()
-    raw_payloads = await feed_cache.get_or_fetch(session, feed_urls, api_key)
+    try:
+        raw_payloads = await redis_store.get_feeds(feed_urls)
+    except Exception:
+        logger.exception("Redis read failed for station=%s", station_code)
+        return {"ok": False, "error": "Arrival data is temporarily unavailable. Please try again shortly."}
     fetch_batch_ms = (time.perf_counter() - fetch_batch_started) * 1000
 
     parse_started = time.perf_counter()
@@ -389,51 +356,45 @@ async def fetch_mta_updates(
             continue
 
         for entity in feed.entity:
-            if not entity.HasField("trip_update"):
-                continue
-
-            trip_update = entity.trip_update
-            train = trip_update.trip.route_id.upper().strip() if trip_update.trip.route_id else ""
-            if train not in TRAIN_FEEDS:
-                continue
-            canonical_train = _ROUTE_ID_ALIASES.get(train, train)
-            if train_filter and canonical_train != train_filter and train != train_filter:
-                continue
-
-            for stu in trip_update.stop_time_update:
-                stop_id = stu.stop_id.upper() if stu.stop_id else ""
-                if len(stop_id) < 2:
+            if entity.HasField("trip_update"):
+                trip_update = entity.trip_update
+                train = trip_update.trip.route_id.upper().strip() if trip_update.trip.route_id else ""
+                if train not in TRAIN_FEEDS:
                     continue
-                stop_base = stop_id[:-1] if stop_id and stop_id[-1] in {"N", "S"} else stop_id
-                if stop_base not in gtfs_base_ids:
+                canonical_train = _ROUTE_ID_ALIASES.get(train, train)
+                if train_filter and canonical_train != train_filter and train != train_filter:
                     continue
 
-                direction_key = "north" if stop_id.endswith("N") else "south" if stop_id.endswith("S") else ""
-                if not direction_key:
-                    continue
-                direction = direction_from_stop_id(stop_id, stop_base)
-                if not direction:
-                    continue
-                if direction_key == "north":
-                    north_label = direction
-                else:
-                    south_label = direction
+                for stu in trip_update.stop_time_update:
+                    stop_id = stu.stop_id.upper() if stu.stop_id else ""
+                    if len(stop_id) < 2:
+                        continue
+                    stop_base = stop_id[:-1] if stop_id and stop_id[-1] in {"N", "S"} else stop_id
+                    if stop_base not in gtfs_base_ids:
+                        continue
 
-                if not stu.HasField("arrival") or stu.arrival.time <= 0:
-                    continue
+                    direction_key = "north" if stop_id.endswith("N") else "south" if stop_id.endswith("S") else ""
+                    if not direction_key:
+                        continue
+                    direction = direction_from_stop_id(stop_id, stop_base)
+                    if not direction:
+                        continue
+                    if direction_key == "north":
+                        north_label = direction
+                    else:
+                        south_label = direction
 
-                arrival_dt = datetime.fromtimestamp(stu.arrival.time, tz=NYC_TZ)
-                minutes = int((arrival_dt - now).total_seconds() // 60)
-                if minutes < _FEED_LATENCY_TOLERANCE_MINUTES:
-                    continue
-                display_minutes = max(0, minutes)
+                    if not stu.HasField("arrival") or stu.arrival.time <= 0:
+                        continue
 
-                arrivals.append((display_minutes, direction_key, canonical_train, arrival_dt.strftime("%I:%M %p")))
+                    arrival_dt = datetime.fromtimestamp(stu.arrival.time, tz=NYC_TZ)
+                    minutes = int((arrival_dt - now).total_seconds() // 60)
+                    if minutes < _FEED_LATENCY_TOLERANCE_MINUTES:
+                        continue
+                    display_minutes = max(0, minutes)
 
-        for entity in feed.entity:
-            if not entity.HasField("alert"):
-                continue
-            if entity.alert.header_text.translation:
+                    arrivals.append((display_minutes, direction_key, canonical_train, arrival_dt.strftime("%I:%M %p")))
+            elif entity.HasField("alert") and entity.alert.header_text.translation:
                 text = entity.alert.header_text.translation[0].text.strip()
                 if text:
                     alert_set.add(text)
@@ -725,14 +686,13 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     train_filter, station_code = last_request
     logger.info("User requested /refresh train=%s station_code=%s", train_filter or "ALL", station_code)
-    session: Optional[aiohttp.ClientSession] = context.application.bot_data.get("session")
-    feed_cache: Optional[FeedBatchCache] = context.application.bot_data.get("feed_cache")
-    if not session or not feed_cache:
+    redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
+    if not redis_store:
         if update.effective_message:
             await update.effective_message.reply_text("Bot is still starting up. Please try again.")
         return
 
-    result = await fetch_mta_updates(session, feed_cache, station_code, train_filter)
+    result = await fetch_mta_updates(redis_store, station_code, train_filter)
     if not result["ok"]:
         if update.effective_message:
             await update.effective_message.reply_text(str(result["error"]))
@@ -779,10 +739,10 @@ async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             chat_id = update.effective_chat.id if update.effective_chat else None
             if chat_id:
                 now = time.monotonic()
-                last = context.application.bot_data.setdefault("last_request_time", {}).get(chat_id, 0.0)
+                last = _LAST_REQUEST_TIME.get(chat_id, 0.0)
                 if now - last < _MIN_REQUEST_INTERVAL_SECONDS:
                     return
-                context.application.bot_data["last_request_time"][chat_id] = now
+                _LAST_REQUEST_TIME[chat_id] = now
 
             logger.info("User requested /next train=%s station_code=%s", train_filter or "ALL", station_code)
 
@@ -806,13 +766,12 @@ async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if update.effective_chat:
                 LAST_REQUEST_BY_CHAT[update.effective_chat.id] = (normalized_train_filter, normalized_station)
 
-            session: Optional[aiohttp.ClientSession] = context.application.bot_data.get("session")
-            feed_cache: Optional[FeedBatchCache] = context.application.bot_data.get("feed_cache")
-            if not session or not feed_cache:
+            redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
+            if not redis_store:
                 await message.reply_text("Bot is still starting up. Please try again.")
                 return
 
-            result = await fetch_mta_updates(session, feed_cache, station_code, normalized_train_filter)
+            result = await fetch_mta_updates(redis_store, station_code, normalized_train_filter)
             if not result["ok"]:
                 await message.reply_text(str(result["error"]))
                 return
@@ -839,8 +798,11 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    context.args = parts
-    await next_train(update, context)
+    class _ArgsProxy:
+        def __init__(self, args: List[str]) -> None:
+            self.args = args
+            self.application = context.application
+    await next_train(update, _ArgsProxy(parts))  # type: ignore[arg-type]
 
 
 
@@ -885,8 +847,7 @@ def main() -> None:
     webhook_path = os.getenv("TELEGRAM_WEBHOOK_PATH", token)
     drop_pending_updates = os.getenv("DROP_PENDING_UPDATES", "false").strip().lower() == "true"
 
-    if not webhook_base_url:
-        start_health_server()
+    start_health_server()
 
     retry_delay_seconds = int(os.getenv("BOT_STARTUP_RETRY_DELAY_SECONDS", str(_DEFAULT_RETRY_DELAY_SECONDS)))
     max_retries = int(os.getenv("BOT_STARTUP_MAX_RETRIES", "0"))
@@ -921,23 +882,14 @@ def main() -> None:
             if webhook_base_url:
                 port = int(os.getenv("PORT", "10000"))
                 webhook_url = f"{webhook_base_url}/{webhook_path}"
-                logger.info("Starting webhook mode on port=%s webhook_url=%s", port, webhook_url)
-                try:
-                    app.run_webhook(
-                        listen="0.0.0.0",
-                        port=port,
-                        url_path=webhook_path,
-                        webhook_url=webhook_url,
-                        drop_pending_updates=drop_pending_updates,
-                    )
-                except RuntimeError as exc:
-                    if "python-telegram-bot[webhooks]" not in str(exc):
-                        raise
-                    logger.error(
-                        "Webhook dependencies are missing and fallback to polling is disabled for safety. "
-                        "Install with: pip install 'python-telegram-bot[webhooks]'."
-                    )
-                    raise
+                logger.info("Starting webhook mode on port=%s", port)
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=port,
+                    url_path=webhook_path,
+                    webhook_url=webhook_url,
+                    drop_pending_updates=drop_pending_updates,
+                )
             else:
                 app.run_polling(drop_pending_updates=drop_pending_updates)
             run_duration_seconds = time.monotonic() - run_started

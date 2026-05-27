@@ -12,6 +12,7 @@ A production-ready Telegram bot that returns real-time NYC subway arrivals using
 - Graceful errors for invalid train lines, station codes, missing params, API issues, and timeouts
 - Static station metadata is loaded once at startup from `data/stations.json` for O(1) station lookups.
 - GTFS feed downloads are asynchronous (`aiohttp` + `asyncio.gather`) with latency instrumentation for feed fetch and protobuf parsing.
+- Real-time GTFS payloads are cached in Redis and shared across all users through an in-process background aggregator loop.
 - Station directions are rendered using metadata labels (e.g., Queens/Manhattan, Canarsie/Manhattan) instead of generic uptown/downtown when available.
 - Shuttle GTFS route IDs are normalized so `GS`, `FS`, and `H` feed trips are treated as `S` for user-facing filtering.
 
@@ -33,6 +34,7 @@ Set these in your shell or `.env` file:
 ```bash
 export TELEGRAM_BOT_TOKEN="your_token"
 export MTA_API_KEY="your_mta_api_key"
+export REDIS_URL="redis://localhost:6379"
 # Optional for auto-wake webhook mode on Render web services
 export TELEGRAM_WEBHOOK_BASE_URL="https://your-service.onrender.com"
 # Optional: custom path segment (defaults to bot token)
@@ -52,7 +54,8 @@ The bot is stateless and uses polling, so it can run on platforms like Render, R
 1. Provision a Python service/container.
 2. Install dependencies with `pip install -r requirements.txt`.
 3. Set `TELEGRAM_BOT_TOKEN` and `MTA_API_KEY` in environment settings.
-4. Start command: `python3 bot.py`.
+4. Set `REDIS_URL` (Upstash Redis URL recommended on free tiers).
+5. Start command: `python3 bot.py`.
 
 ### Startup reliability on cloud platforms
 If Telegram is temporarily unreachable during deploy/startup, the bot now retries startup automatically instead of crashing.
@@ -74,6 +77,13 @@ If you deploy this bot as a **Render Web Service**, Render requires the process 
 The bot now starts a lightweight health server automatically when `PORT` is set, so `python3 bot.py` works on Render web services while polling Telegram updates.
 
 If you prefer not to expose an HTTP port at all, deploy as a **Background Worker** instead.
+
+### Redis + in-process aggregator architecture
+- One service runs both:
+  - Telegram bot loop
+  - Background feed aggregator (polls MTA every 60s)
+- On startup, the bot does a synchronous warm poll so Redis is populated before user commands are served.
+- User commands read protobuf bytes from Redis instead of calling MTA per request.
 
 
 ### Telegram polling conflict troubleshooting
