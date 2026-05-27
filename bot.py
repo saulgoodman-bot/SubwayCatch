@@ -855,7 +855,8 @@ def main() -> None:
     webhook_path = os.getenv("TELEGRAM_WEBHOOK_PATH", token)
     drop_pending_updates = os.getenv("DROP_PENDING_UPDATES", "false").strip().lower() == "true"
 
-    start_health_server()
+    if not webhook_base_url:
+        start_health_server()
 
     retry_delay_seconds = int(os.getenv("BOT_STARTUP_RETRY_DELAY_SECONDS", str(_DEFAULT_RETRY_DELAY_SECONDS)))
     max_retries = int(os.getenv("BOT_STARTUP_MAX_RETRIES", "0"))
