@@ -341,6 +341,14 @@ async def fetch_mta_updates(
     except Exception:
         logger.exception("Redis read failed for station=%s", station_code)
         return {"ok": False, "error": "Arrival data is temporarily unavailable. Please try again shortly."}
+    # ADD THIS — friendly message when cache is completely cold:
+    if not any(raw_payloads.values()):
+        is_healthy = await redis_store.is_healthy()
+        if not is_healthy:
+            return {
+                "ok": False,
+                "error": "⏳ The aggregator is warming up (usually takes under 60s). Please try again shortly.",
+            }
     fetch_batch_ms = (time.perf_counter() - fetch_batch_started) * 1000
 
     parse_started = time.perf_counter()

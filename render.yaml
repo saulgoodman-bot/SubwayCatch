@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: nyc-subway-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # set manually in Render dashboard
+      - key: MTA_API_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false          # paste your Upstash rediss:// URL
+      - key: PORT
+        value: 10000         # Render's default; triggers the health server in bot.py
+      - key: DROP_PENDING_UPDATES
+        value: false
+    healthCheckPath: /
