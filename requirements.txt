@@ -5,3 +5,4 @@ gtfs-realtime-bindings>=1.0.0
 pytz>=2024.1
 python-dotenv>=1.0.1
 thefuzz>=0.22.1
+redis>=5.0.0
