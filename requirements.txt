@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]>=20.0
+python-telegram-bot[webhooks]>=20.5
 aiohttp>=3.10.0
 protobuf>=4.25.0
 gtfs-realtime-bindings>=1.0.0
@@ -6,4 +6,3 @@ pytz>=2024.1
 python-dotenv>=1.0.1
 thefuzz>=0.22.1
 redis>=5.0.0
-python-Levenshtein>=0.25.0

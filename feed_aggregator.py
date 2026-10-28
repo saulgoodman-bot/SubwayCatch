@@ -5,6 +5,7 @@ import os
 import logging
 import time
 from dotenv import load_dotenv
+from google.transit import gtfs_realtime_pb2
 from redis_feed_store import RedisFeedStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -26,7 +27,12 @@ async def fetch_feed(session: aiohttp.ClientSession, url: str, api_key: str):
     try:
         async with session.get(url, headers={"x-api-key": api_key}) as response:
             response.raise_for_status()
-            return url, await response.read()
+            data = await response.read()
+            feed = gtfs_realtime_pb2.FeedMessage()
+            feed.ParseFromString(data)
+            if not feed.IsInitialized():
+                raise ValueError("Incomplete GTFS feed")
+            return url, data
     except Exception as e:
         logger.error(f"Failed to fetch {url}: {e}")
         return url, None
@@ -65,15 +71,18 @@ async def main():
     
     logger.info("Starting NYC Subway Data Aggregator...")
     
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            start = time.time()
-            await poll_all_feeds(session, store, api_key)
-            elapsed = time.time() - start
-            sleep_time = max(0, 60.0 - elapsed)
-            
-            logger.info("Poll cycle complete in %.2fs. Sleeping for %.2fs", elapsed, sleep_time)
-            await asyncio.sleep(sleep_time)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                start = time.time()
+                await poll_all_feeds(session, store, api_key)
+                elapsed = time.time() - start
+                sleep_time = max(0, 60.0 - elapsed)
+
+                logger.info("Poll cycle complete in %.2fs. Sleeping for %.2fs", elapsed, sleep_time)
+                await asyncio.sleep(sleep_time)
+    finally:
+        await store.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

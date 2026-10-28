@@ -1,6 +1,6 @@
 # NYC Subway Arrival Telegram Bot
 
-A production-ready Telegram bot that returns real-time NYC subway arrivals using MTA GTFS-Realtime feeds.
+A Telegram bot that returns real-time NYC subway arrivals using MTA GTFS-Realtime feeds.
 
 ## Features
 - `/start` welcome message
@@ -17,7 +17,7 @@ A production-ready Telegram bot that returns real-time NYC subway arrivals using
 - Shuttle GTFS route IDs are normalized so `GS`, `FS`, and `H` feed trips are treated as `S` for user-facing filtering.
 
 ## Requirements
-- Python 3.10+
+- Python 3.11+
 - Telegram bot token
 - MTA API key
 
@@ -39,6 +39,8 @@ export REDIS_URL="redis://localhost:6379"
 export TELEGRAM_WEBHOOK_BASE_URL="https://your-service.onrender.com"
 # Optional: custom path segment (defaults to bot token)
 export TELEGRAM_WEBHOOK_PATH="telegram-webhook"
+# Recommended with a custom webhook path: Telegram authenticates requests with this secret
+export TELEGRAM_WEBHOOK_SECRET="replace-with-a-random-secret"
 # Optional: keep queued updates on startup (default false)
 export DROP_PENDING_UPDATES="false"
 ```
@@ -49,7 +51,7 @@ python3 bot.py
 ```
 
 ## Deploy to Cloud
-The bot is stateless and uses polling, so it can run on platforms like Render, Railway, Fly.io, or a VM.
+The bot supports polling and webhooks. Last-query and rate-limit state is kept in process memory and resets on restart. Redis stores shared feed payloads.
 
 1. Provision a Python service/container.
 2. Install dependencies with `pip install -r requirements.txt`.
@@ -82,7 +84,7 @@ If you prefer not to expose an HTTP port at all, deploy as a **Background Worker
 - One service runs both:
   - Telegram bot loop
   - Background feed aggregator (polls MTA every 60s)
-- On startup, the bot does a synchronous warm poll so Redis is populated before user commands are served.
+- On startup, the bot awaits an asynchronous warm poll so Redis is populated before user commands are served.
 - User commands read protobuf bytes from Redis instead of calling MTA per request.
 
 
@@ -101,3 +103,23 @@ In webhook mode, Telegram delivers updates to your Render URL, which wakes the s
 Webhook mode requires PTB webhook extras (already included in `requirements.txt` via `python-telegram-bot[webhooks]`).
 
 By default, startup does not drop pending updates anymore, so commands sent while the service was restarting are still processed. Set `DROP_PENDING_UPDATES=true` only if you explicitly want to discard backlog.
+
+
+## Architecture and development
+
+- `bot.py`: application entry point, Telegram handlers, arrival parsing, HTTP health endpoint, startup/retry lifecycle.
+- `feed_aggregator.py`: concurrent feed downloads; runs inside the bot or independently with `python3 feed_aggregator.py`.
+- `redis_feed_store.py`: binary payload cache with a 300-second TTL and poll diagnostics.
+- `station_metadata.py`: startup loading and indexes for `data/stations.json` and `data/station_config.json`.
+- `render.yaml`: Render web-service deployment. Webhooks are selected automatically when `RENDER_EXTERNAL_URL` is present. In polling mode, `PORT` enables a separate health server.
+
+Start a local Redis server before running the bot. Copy `.env.example` to `.env` and fill in the settings. The health endpoint checks process liveness only; it does not verify feed freshness or Redis reachability.
+
+Run offline regression tests and syntax checks after installing dependencies:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q bot.py feed_aggregator.py redis_feed_store.py station_metadata.py tests
+```
+
+There is no separate build step, formatter, linter, or type-checker configured. CI runs these checks on Python 3.11 and 3.14. Tests use synthetic protobuf feeds and mock Redis/Telegram rather than production credentials.

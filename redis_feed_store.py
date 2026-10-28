@@ -27,7 +27,7 @@ _FEED_KEY_PREFIX = "gtfs:feed:"
 _LAST_UPDATED_KEY = "gtfs:last_updated"
 _STATS_KEY = "gtfs:stats"
 
-# 2x the poll interval so a single missed cycle never evicts live data.
+# Five poll intervals allow recovery from transient feed failures.
 FEED_TTL_SECONDS = 300
 # Data older than this is considered unhealthy (3 missed polls + slack).
 STALENESS_THRESHOLD_SECONDS = 210
@@ -66,13 +66,18 @@ class RedisFeedStore:
             retry_on_timeout=True,
             max_connections=10,
         )
-        await self._client.ping()
+        try:
+            await self._client.ping()
+        except BaseException:
+            await self.close()
+            raise
         logger.info("Redis connected")
 
     async def close(self) -> None:
         """Drain the connection pool gracefully."""
         if self._client:
             await self._client.aclose()
+            self._client = None
             logger.info("Redis connection pool closed")
 
     # ------------------------------------------------------------------

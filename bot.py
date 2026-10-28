@@ -52,6 +52,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("subway_bot")
+# HTTP request URLs contain the Telegram bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _POLLING_CONFLICT = threading.Event()
 NYC_TZ = pytz.timezone("America/New_York")
@@ -90,8 +92,8 @@ TRAIN_FEEDS: Dict[str, str] = {
     "7": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
     "S": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
     "GS": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
-    "FS": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
-    "H": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
+    "FS": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace",
+    "H": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace",
     "SI": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si",
     "5X": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
     "6X": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
@@ -299,7 +301,10 @@ async def fetch_mta_updates(
     stop_id_prefixes = STATION_ALIAS_TO_STOP_PREFIXES[station_code]
     gtfs_base_ids: Set[str] = set(stop_id_prefixes)
     if train_filter:
-        feeds_for_request = {TRAIN_FEEDS[train_filter]}
+        feeds_for_request = (
+            {TRAIN_FEEDS["GS"], TRAIN_FEEDS["FS"], TRAIN_FEEDS["H"]}
+            if train_filter == "S" else {TRAIN_FEEDS[train_filter]}
+        )
     else:
         serving_routes: Set[str] = set()
         for prefix in stop_id_prefixes:
@@ -307,6 +312,8 @@ async def fetch_mta_updates(
             if station_info:
                 serving_routes.update(station_info["routes"])
         feeds_for_request = {TRAIN_FEEDS[route] for route in serving_routes if route in TRAIN_FEEDS}
+        if "S" in serving_routes:
+            feeds_for_request.update({TRAIN_FEEDS["GS"], TRAIN_FEEDS["FS"], TRAIN_FEEDS["H"]})
         if not feeds_for_request:
             logger.error(
                 "No feeds found for station_code=%s stop_prefixes=%s; check route entries in stations.json",
@@ -341,14 +348,11 @@ async def fetch_mta_updates(
     except Exception:
         logger.exception("Redis read failed for station=%s", station_code)
         return {"ok": False, "error": "Arrival data is temporarily unavailable. Please try again shortly."}
-    # ADD THIS — friendly message when cache is completely cold:
-    if not any(raw_payloads.values()):
-        is_healthy = await redis_store.is_healthy()
-        if not is_healthy:
-            return {
-                "ok": False,
-                "error": "⏳ The aggregator is warming up (usually takes under 60s). Please try again shortly.",
-            }
+    if any(not raw_payloads.get(url) for url in feed_urls):
+        return {
+            "ok": False,
+            "error": "Arrival data is temporarily incomplete. Please try again shortly.",
+        }
     fetch_batch_ms = (time.perf_counter() - fetch_batch_started) * 1000
 
     parse_started = time.perf_counter()
@@ -366,6 +370,8 @@ async def fetch_mta_updates(
         for entity in feed.entity:
             if entity.HasField("trip_update"):
                 trip_update = entity.trip_update
+                if trip_update.trip.schedule_relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
+                    continue
                 train = trip_update.trip.route_id.upper().strip() if trip_update.trip.route_id else ""
                 if train not in TRAIN_FEEDS:
                     continue
@@ -374,6 +380,8 @@ async def fetch_mta_updates(
                     continue
 
                 for stu in trip_update.stop_time_update:
+                    if stu.schedule_relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED:
+                        continue
                     stop_id = stu.stop_id.upper() if stu.stop_id else ""
                     if len(stop_id) < 2:
                         continue
@@ -392,10 +400,14 @@ async def fetch_mta_updates(
                     else:
                         south_label = direction
 
-                    if not stu.HasField("arrival") or stu.arrival.time <= 0:
+                    event = stu.arrival if stu.HasField("arrival") and stu.arrival.time > 0 else stu.departure
+                    if event.time <= 0:
                         continue
 
-                    arrival_dt = datetime.fromtimestamp(stu.arrival.time, tz=NYC_TZ)
+                    try:
+                        arrival_dt = datetime.fromtimestamp(event.time, tz=NYC_TZ)
+                    except (ValueError, OverflowError, OSError):
+                        continue
                     minutes = int((arrival_dt - now).total_seconds() // 60)
                     if minutes < _FEED_LATENCY_TOLERANCE_MINUTES:
                         continue
@@ -693,22 +705,10 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     train_filter, station_code = last_request
-    logger.info("User requested /refresh train=%s station_code=%s", train_filter or "ALL", station_code)
-    redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
-    if not redis_store:
-        if update.effective_message:
-            await update.effective_message.reply_text("Bot is still starting up. Please try again.")
-        return
+    from types import SimpleNamespace
 
-    result = await fetch_mta_updates(redis_store, station_code, train_filter)
-    if not result["ok"]:
-        if update.effective_message:
-            await update.effective_message.reply_text(str(result["error"]))
-        return
-
-    message = build_arrival_message(result, train_filter)
-    if update.effective_message:
-        await update.effective_message.reply_text(message, parse_mode="HTML", reply_markup=refresh_reply_markup())
+    args = [train_filter, station_code] if train_filter else [station_code]
+    await next_train(update, SimpleNamespace(args=args, application=context.application))
 
 
 async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -771,9 +771,6 @@ async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     "To look up the Grand St station use: /next GS"
                 )
 
-            if update.effective_chat:
-                LAST_REQUEST_BY_CHAT[update.effective_chat.id] = (normalized_train_filter, normalized_station)
-
             redis_store: Optional[RedisFeedStore] = context.application.bot_data.get("redis_store")
             if not redis_store:
                 await message.reply_text("Bot is still starting up. Please try again.")
@@ -783,6 +780,9 @@ async def next_train(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if not result["ok"]:
                 await message.reply_text(str(result["error"]))
                 return
+
+            if update.effective_chat:
+                LAST_REQUEST_BY_CHAT[update.effective_chat.id] = (normalized_train_filter, normalized_station)
 
             train_scope = str(result.get("train_filter", "")).upper()
             response_text = build_arrival_message(result, train_scope)
@@ -823,7 +823,7 @@ async def handle_application_error(update: object, context: ContextTypes.DEFAULT
             "Telegram polling conflict detected (409). "
             "Only one active bot instance can poll this token. Stopping current instance."
         )
-        await context.application.stop()
+        context.application.stop_running()
         return
 
     logger.exception("Unhandled exception while processing update", exc_info=context.error)
@@ -861,6 +861,8 @@ def main() -> None:
     retry_delay_seconds = int(os.getenv("BOT_STARTUP_RETRY_DELAY_SECONDS", str(_DEFAULT_RETRY_DELAY_SECONDS)))
     max_retries = int(os.getenv("BOT_STARTUP_MAX_RETRIES", "0"))
     # BOT_STARTUP_MAX_RETRIES=0 means retry forever.
+    if retry_delay_seconds <= 0 or max_retries < 0:
+        raise ValueError("Retry delay must be positive and max retries must be nonnegative.")
     current_retry_delay = retry_delay_seconds
 
     attempt = 0
@@ -871,6 +873,8 @@ def main() -> None:
         logger.info("Starting NYC Subway Arrival Bot (attempt %s)", attempt)
         run_started = time.monotonic()
 
+        # PTB closes its event loop after each run, including failed startup.
+        asyncio.set_event_loop(asyncio.new_event_loop())
         app = (
             Application.builder()
             .token(token)
@@ -897,6 +901,7 @@ def main() -> None:
                     port=port,
                     url_path=webhook_path,
                     webhook_url=webhook_url,
+                    secret_token=os.getenv("TELEGRAM_WEBHOOK_SECRET") or None,
                     drop_pending_updates=drop_pending_updates,
                 )
             else:
@@ -909,11 +914,15 @@ def main() -> None:
                     "Polling stopped due to Telegram conflict; retrying in %s seconds.",
                     retry_delay_seconds,
                 )
+                if max_retries > 0 and attempt >= max_retries:
+                    raise RuntimeError("Polling conflict retry limit reached")
                 time.sleep(retry_delay_seconds)
                 continue
             logger.info("Bot polling stopped gracefully.")
             break
         except Conflict:
+            if max_retries > 0 and attempt >= max_retries:
+                raise
             logger.exception(
                 "Telegram conflict during startup/polling. Retrying in %s seconds.",
                 retry_delay_seconds,
